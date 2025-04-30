@@ -1,111 +1,300 @@
 import os
 import json
-from flask_cors import CORS #allows you to call the flask functions
-from flask import Flask, request, jsonify
+import uuid
+import logging
+from flask_cors import CORS
+from flask import Flask, request, jsonify, send_from_directory, render_template, url_for
+import PyPDF2
 
-from dotenv import load_dotenv
+from API_services.gpt import GPT_Process_PDFs
+from API_services.cloud_convert import process_file_for_gpt
 
-from API_services.apify import APIFY_LinkedIn_WebScrape
-from API_services.gemini import GEMINI_Response
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-load_dotenv("../.env")
+# Create Flask app
+app = Flask(__name__, 
+            static_folder='../frontend/static',
+            template_folder='../frontend/templates')
 
-app = Flask(__name__)
-CORS(app)
+# Enable CORS for all routes and all domains
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+# Create a directory to store uploaded PDFs
+UPLOAD_FOLDER = os.path.join('..', 'frontend', 'static', 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-@app.route('/scrape-linkedin', methods=['POST']) #call from the frontend to ask to webscrape
-def scrape_linkedin():
-    userInput = request.get_json()
-    """ Looks like this:
-        userInput = {
-                    'url': 'https://www.linkedin.com/username', 
-                    'prompt': 'I want to message this person to tell them that I want to work with them'
-                    }
-    """
-    #helper function to check and make sure the UserInput isn't messed up (EX: the url is not there)
-    validateUserInput(userInput)
+def extract_text(pdf_file):
+    """Extract text from a PDF file"""
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    text = ''
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
+
+@app.route('/')
+def index():
+    """Serve the frontend interface"""
+    return render_template('index.html')
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    """Serve uploaded files"""
+    if filename.endswith('.pdf'):
+        logger.info(f"Serving PDF file: {filename}")
+        response = send_from_directory(UPLOAD_FOLDER, filename, mimetype='application/pdf')
+        # Add headers to help with caching and display
+        response.headers['Content-Disposition'] = f'inline; filename="{filename}"'
+        response.headers['Cache-Control'] = 'no-cache'
+        return response
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+@app.route('/api/process-documents', methods=['POST', 'OPTIONS'])
+def process_documents():
+    """Process documents using CloudConvert and GPT"""
+    # Handle preflight CORS request
+    if request.method == 'OPTIONS':
+        return '', 204
     
-    url = userInput['url']
-    prompt = userInput['prompt']
+    # Log the request details
+    logger.info(f"Received request to process documents")
+    logger.debug(f"Request headers: {request.headers}")
+    logger.debug(f"Request form data: {request.form}")
+    logger.debug(f"Request files: {list(request.files.keys())}")
     
-    try:
-        #WS_info is shorthand for web scrape info
-        WS_info = APIFY_LinkedIn_WebScrape(url)
-
-        aiResponse = GEMINI_Response(WS_info, prompt)
-
-        return jsonify({
-            'email_address': WS_info.get("email"), #gets the email from the Web Scraping
-            'email_body': aiResponse['email_output'], #Generated email body via Gemeni
-            'analysis_rationale': aiResponse['analysis_rationale'], #generated analysis built by Gemeni
-        })
-
-    #If this is ran, you definatly blundered somewhere
-    except Exception as e:
-        return jsonify({'error located in app.py/sceape_linkedin': str(e)}), 500
-
-#TODO: FIX THIS VIBE CODED Garbage, We need to fix the GEMENI_Response function
-@app.route('/improve-email', methods=['POST'])
-def improve_email():
-
+    # Get files from request - handle both 'files' and 'file' keys
+    files = []
+    if 'files' in request.files:
+        files = request.files.getlist('files')
+        logger.info(f"Found {len(files)} files under 'files' key")
+    elif 'file' in request.files:
+        files = [request.files['file']]
+        logger.info(f"Found 1 file under 'file' key")
     
-    data = request.get_json()
+    # Error handling
+    if not files or all(not file.filename for file in files):
+        logger.error("No files provided in request")
+        return jsonify({'error': 'No files provided'}), 400
     
-    if not data or 'email' not in data or 'prompt' not in data:
-        return jsonify({'error': 'Missing email or prompt in request'}), 400
-
-    email_content = data['email']
-
-    prompt = data['prompt']
-    recipient_name = data.get('recipient_name', 'the recipient')
+    # Get optional context from the form
+    context = request.form.get('context', '')
+    if context:
+        logger.info(f"Received context: {context[:100]}...")
     
-    try:
-        message = client.models.generate_content(
-            model="gemini-2.0-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=
-                    "You're a skilled B2B copywriter who knows how to improve cold emails to make them more effective. Your job is to refine and enhance an existing email based on specific improvement instructions.\n\n**Your task:**\nImprove the provided email using the following rules:\n\n- Always start with: **Dear [First Name],**\n- Keep it brief — aim for **4 to 6 sentences total**\n- Make it personal and maintain any personalization from the original email\n- Focus on **real value** — how does this offering help solve a challenge or make their work easier, faster, or more effective?\n- Use a **natural, conversational tone** — like it was written by a thoughtful human\n- End with a **light, low-pressure CTA** — like asking if they'd be open to a quick call or if it makes sense to connect\n- Avoid all fluff — skip generic intros like \"Hope you're well,\" marketing buzzwords, or long walls of text\n\n**Output format (JSON only):**\n```json\n{\n  \"email_output\": \"The full body of the improved email starting with 'Dear [First Name],'\",\n  \"improvement_rationale\": [\n    \"Explanation of key improvements made to the email\",\n    \"How the improvements address the specific prompt instructions\",\n    \"Why these changes will make the email more effective\"\n  ]\n}\n```\n\n**Never include anything outside this JSON structure. No explanations, no extra text, just valid JSON.**"
-                ,
-            ),
-            contents=[
-                f"Here is the original email:\n\n{email_content}\n\nThe recipient's name is {recipient_name}.\n\nImprovement instructions: {prompt}"
-            ]
-        )
-
-        response = message.text
-        
-        # Extract JSON from the response
-        if '```json' in response and '```' in response:
-            json_str = response.split('```json')[1].split('```')[0].strip()
-        else:
-            json_str = response
+    # Log file details
+    for file in files:
+        logger.info(f"Processing file: {file.filename}, Content-Type: {file.content_type}")
+    
+    # Process files one at a time
+    results = []
+    for file in files:
+        try:
+            # Convert to PDF and process with GPT in one step
+            logger.info(f"Starting processing of file: {file.filename}")
             
-        json_response = json.loads(json_str)
-
-        return jsonify({
-            'improved_email': json_response['email_output'],
-            'improvement_rationale': json_response['improvement_rationale'],
-        })
+            # Pass the context if provided
+            logger.debug("Converting file to PDF and extracting text")
+            file_results = process_file_for_gpt(file, GPT_Process_PDFs, file.filename)
+            
+            logger.info(f"Processing complete for file: {file.filename}")
+            
+            # Add results to the list
+            if file_results and len(file_results) > 0:
+                result = file_results[0]
+                
+                # If we have a PDF path from the conversion
+                if 'pdf_path' in result and os.path.exists(result['pdf_path']):
+                    # Create a unique filename for the PDF
+                    pdf_filename = f"{uuid.uuid4().hex}.pdf"
+                    pdf_destination = os.path.join(UPLOAD_FOLDER, pdf_filename)
+                    
+                    # Copy the PDF to the static folder
+                    logger.info(f"Copying PDF from {result['pdf_path']} to {pdf_destination}")
+                    os.rename(result['pdf_path'], pdf_destination)
+                    
+                    # Add PDF URL to the result
+                    pdf_url = url_for('uploaded_file', filename=pdf_filename)
+                    result['pdf_url'] = pdf_url
+                    logger.info(f"PDF URL added to result: {pdf_url}")
+                
+                # Add filename if not already present
+                if 'filename' not in result:
+                    result['filename'] = file.filename
+                
+                # Log highlighting statistics
+                if 'marked_content' in result:
+                    html_content = result['marked_content']
+                    low_count = html_content.count('<mark class="low">')
+                    medium_count = html_content.count('<mark class="medium">')
+                    high_count = html_content.count('<mark class="high">')
+                    
+                    logger.info(f"Highlighting statistics for {file.filename}:")
+                    logger.info(f"  - Low sensitivity: {low_count} marks")
+                    logger.info(f"  - Medium sensitivity: {medium_count} marks")
+                    logger.info(f"  - High sensitivity: {high_count} marks")
+                    logger.info(f"  - Total highlights: {low_count + medium_count + high_count}")
+                
+                results.append(result)
+                
+        except Exception as e:
+            # Log the error but continue processing other files
+            logger.error(f"Error processing file {file.filename}: {str(e)}", exc_info=True)
+            # Add error to results
+            results.append({
+                "filename": file.filename,
+                "error": str(e),
+                "marked_content": f"<p>Error processing file: {str(e)}</p>"
+            })
     
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # Log the response
+    logger.info(f"Returning {len(results)} results")
+    return jsonify(results)
 
-
-"""[Handwritten] This is used to validate the User Input to make sure it's legit"""
-def validateUserInput(userInput):
-    #Check to see if backend even received the userInput:
-    if not userInput:
-        return jsonify({'error': 'backend didnt receive userInput'}), 400
-    
-    # Check to see if url was received by backend
-    if 'url' not in userInput:
-        return jsonify({'error': 'Missing URL in request'}), 400
-
-    # Check to see if prompt was received by backend
-    if 'prompt' not in userInput:
-        return jsonify({'error': 'Missing prompt in request'}), 400
-
+@app.after_request
+def after_request(response):
+    """Add CORS headers to every response"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Create directories if they don't exist
+    os.makedirs('../frontend/templates', exist_ok=True)
+    os.makedirs('../frontend/static', exist_ok=True)
+    
+    # Create a basic index.html if it doesn't exist
+    if not os.path.exists('../frontend/templates/index.html'):
+        with open('../frontend/templates/index.html', 'w') as f:
+            f.write('''<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Analysis Tool</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .upload-container { border: 2px dashed #ccc; padding: 20px; text-align: center; }
+        .results { margin-top: 20px; }
+        .document-container { margin-bottom: 40px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+        .pdf-viewer { width: 100%; height: 600px; border: 1px solid #ccc; margin-bottom: 20px; }
+        .highlighted-text { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
+        mark.low { background-color: yellow; padding: 2px 0; border-radius: 2px; }
+        mark.medium { background-color: orange; padding: 2px 0; border-radius: 2px; }
+        mark.high { background-color: red; padding: 2px 0; border-radius: 2px; color: white; }
+        .legend { margin-top: 10px; font-size: 14px; }
+        .legend-item { display: inline-block; margin-right: 20px; }
+        .legend-color { display: inline-block; width: 20px; height: 14px; margin-right: 5px; vertical-align: middle; }
+        .low-color { background-color: yellow; }
+        .medium-color { background-color: orange; }
+        .high-color { background-color: red; }
+    </style>
+</head>
+<body>
+    <h1>Document Analysis Tool</h1>
+    
+    <div class="upload-container">
+        <h2>Upload Documents</h2>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <input type="file" id="fileInput" name="files" multiple accept=".pdf,.docx,.xlsx">
+            <textarea id="contextInput" placeholder="Optional: Provide additional context about the document..." rows="3" style="width: 100%; margin-top: 10px;"></textarea>
+            <button type="submit">Analyze Documents</button>
+        </form>
+    </div>
+    
+    <div class="results" id="results"></div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData();
+            const fileInput = document.getElementById('fileInput');
+            const contextInput = document.getElementById('contextInput');
+            
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('files', fileInput.files[i]);
+            }
+            
+            // Add context if provided
+            if (contextInput.value.trim()) {
+                formData.append('context', contextInput.value);
+            }
+            
+            document.getElementById('results').innerHTML = '<p>Processing documents... This may take a while.</p>';
+            
+            try {
+                const response = await fetch('/api/process-documents', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                let resultsHTML = '<h2>Analysis Results</h2>';
+                
+                if (data.length === 0) {
+                    resultsHTML += '<p>No results returned.</p>';
+                } else {
+                    // Add legend
+                    resultsHTML += `
+                        <div class="legend">
+                            <p><strong>Sensitivity Legend:</strong></p>
+                            <div class="legend-item"><span class="legend-color low-color"></span> Low Sensitivity</div>
+                            <div class="legend-item"><span class="legend-color medium-color"></span> Medium Sensitivity</div>
+                            <div class="legend-item"><span class="legend-color high-color"></span> High Sensitivity</div>
+                        </div>
+                    `;
+                    
+                    data.forEach(result => {
+                        resultsHTML += `<div class="document-container">`;
+                        resultsHTML += `<h3>Results for ${result.filename}</h3>`;
+                        
+                        if (result.error) {
+                            resultsHTML += `<p>Error: ${result.error}</p>`;
+                        } else {
+                            // Display PDF if available
+                            if (result.pdf_url) {
+                                resultsHTML += `
+                                    <h4>Original Document</h4>
+                                    <iframe class="pdf-viewer" src="${result.pdf_url}"></iframe>
+                                `;
+                            }
+                            
+                            // Count highlights
+                            const content = result.marked_content || '';
+                            const lowCount = (content.match(/<mark class="low">/g) || []).length;
+                            const mediumCount = (content.match(/<mark class="medium">/g) || []).length;
+                            const highCount = (content.match(/<mark class="high">/g) || []).length;
+                            const totalCount = lowCount + mediumCount + highCount;
+                            
+                            // Display highlight counts
+                            resultsHTML += `
+                                <div class="highlight-counts">
+                                    <p><strong>Highlight Counts:</strong></p>
+                                    <p>Low Sensitivity: ${lowCount} | Medium Sensitivity: ${mediumCount} | High Sensitivity: ${highCount} | Total: ${totalCount}</p>
+                                </div>
+                            `;
+                            
+                            // Display highlighted text
+                            resultsHTML += `
+                                <h4>Document with Highlighted Sensitive Information</h4>
+                                <div class="highlighted-text">${result.marked_content}</div>
+                            `;
+                        }
+                        
+                        resultsHTML += `</div>`;
+                    });
+                }
+                
+                document.getElementById('results').innerHTML = resultsHTML;
+                
+            } catch (error) {
+                document.getElementById('results').innerHTML = `<p>Error: ${error.message}</p>`;
+            }
+        });
+    </script>
+</body>
+</html>''')
+    
+    logger.info("Starting Flask server on port 5001")
+    app.run(debug=True, port=5001, host='0.0.0.0')

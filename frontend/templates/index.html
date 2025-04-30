@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Analysis Tool</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .upload-container { border: 2px dashed #ccc; padding: 20px; text-align: center; }
+        .results { margin-top: 20px; }
+        .document-container { margin-bottom: 40px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+        .pdf-viewer { width: 100%; height: 600px; border: 1px solid #ccc; margin-bottom: 20px; }
+        .highlighted-text { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
+        mark.low { background-color: yellow; }
+        mark.medium { background-color: orange; }
+        mark.high { background-color: red; }
+        .legend { margin-top: 10px; font-size: 14px; }
+        .legend-item { display: inline-block; margin-right: 20px; }
+        .legend-color { display: inline-block; width: 20px; height: 14px; margin-right: 5px; vertical-align: middle; }
+        .low-color { background-color: yellow; }
+        .medium-color { background-color: orange; }
+        .high-color { background-color: red; }
+    </style>
+</head>
+<body>
+    <h1>Document Analysis Tool</h1>
+    
+    <div class="upload-container">
+        <h2>Upload Documents</h2>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <input type="file" id="fileInput" name="files" multiple accept=".pdf,.docx,.xlsx">
+            <button type="submit">Analyze Documents</button>
+        </form>
+    </div>
+    
+    <div class="results" id="results"></div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData();
+            const fileInput = document.getElementById('fileInput');
+            
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('files', fileInput.files[i]);
+            }
+            
+            document.getElementById('results').innerHTML = '<p>Processing documents... This may take a while.</p>';
+            
+            try {
+                const response = await fetch('/api/process-documents', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                let resultsHTML = '<h2>Analysis Results</h2>';
+                
+                if (data.length === 0) {
+                    resultsHTML += '<p>No results returned.</p>';
+                } else {
+                    // Add legend
+                    resultsHTML += `
+                        <div class="legend">
+                            <p><strong>Sensitivity Legend:</strong></p>
+                            <div class="legend-item"><span class="legend-color low-color"></span> Low Sensitivity</div>
+                            <div class="legend-item"><span class="legend-color medium-color"></span> Medium Sensitivity</div>
+                            <div class="legend-item"><span class="legend-color high-color"></span> High Sensitivity</div>
+                        </div>
+                    `;
+                    
+                    data.forEach(result => {
+                        resultsHTML += `<div class="document-container">`;
+                        resultsHTML += `<h3>Results for ${result.filename}</h3>`;
+                        
+                        if (result.error) {
+                            resultsHTML += `<p>Error: ${result.error}</p>`;
+                        } else {
+                            // Display PDF if available
+                            if (result.pdf_url) {
+                                resultsHTML += `
+                                    <h4>Original Document</h4>
+                                    <iframe class="pdf-viewer" src="${result.pdf_url}"></iframe>
+                                `;
+                            }
+                            
+                            // Display highlighted text
+                            resultsHTML += `
+                                <h4>Document with Highlighted Sensitive Information</h4>
+                                <div class="highlighted-text">${result.marked_content}</div>
+                            `;
+                        }
+                        
+                        resultsHTML += `</div>`;
+                    });
+                }
+                
+                document.getElementById('results').innerHTML = resultsHTML;
+                
+            } catch (error) {
+                document.getElementById('results').innerHTML = `<p>Error: ${error.message}</p>`;
+            }
+        });
+    </script>
+</body>
+</html>
